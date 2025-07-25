@@ -138,11 +138,14 @@ class TestPatroni(unittest.TestCase):
         def mock_signal(signo, handler):
             handler(signo, None)
 
-        with patch('signal.signal', mock_signal):
+        with patch('signal.signal', mock_signal), patch('os.kill') as mock_kill:
             with patch('os.waitpid', Mock(side_effect=[(1, 0), (0, 0)])):
                 _main()
+                mock_kill.assert_called_with(mock_process.return_value.pid, signal.SIGTERM)
+                first_call_count = mock_kill.call_count
             with patch('os.waitpid', Mock(side_effect=OSError)):
                 _main()
+                self.assertEqual(mock_kill.call_count, first_call_count * 2)
 
         ref = {'passtochild': lambda signo, stack_frame: 0}
 
