@@ -65,7 +65,59 @@ class PostmasterProcess(psutil.Process):
         except IOError:
             return {}
 
+    def _read_postmaster_opts(self, data_dir: str) -> Dict[str, str]:
+        """Read postmaster.opts and return config options as dict"""
+        result: Dict[str, str] = {}
+        try:
+            with open(os.path.join(data_dir, 'postmaster.opts')) as f:
+                data = f.read()
+                for opt in data.split('" "'):
+                    if '=' in opt and opt.startswith('--'):
+                        name, val = opt.split('=', 1)
+                        result[name.strip('-')] = val.rstrip('"\n')
+        except IOError:
+            pass  # Silently ignore, will fall back to time-based check
+        return result
+
+    def _verify_process_options(self, expected_opts: Dict[str, str], actual_cmdline: List[str]) -> bool:
+        """Verify that process command line contains expected configuration options"""
+        # Extract key=value options from actual command line
+        actual_opts = {}
+        for i, arg in enumerate(actual_cmdline):
+            if arg.startswith('--') and '=' in arg:
+                key, value = arg.split('=', 1)
+                actual_opts[key.strip('-')] = value
+        
+        # Check that all expected options match
+        for key, expected_value in expected_opts.items():
+            if key not in actual_opts or actual_opts[key] != expected_value:
+                return False
+        
+        return True
+
     def _is_postmaster_process(self) -> bool:
+        # Extra safety check. The process can't be ourselves, our parent or our direct child.
+        if self.pid == os.getpid() or self.pid == os.getppid() or self.ppid() == os.getpid():
+            logger.info('Patroni (pid=%s, ppid=%s), "fake postmaster" (pid=%s, ppid=%s)',
+                        os.getpid(), os.getppid(), self.pid, self.ppid())
+            return False
+        
+        # Try command-line option verification first
+        data_dir = self._postmaster_pid.get('data_dir', '')
+        if data_dir:
+            expected_opts = self._read_postmaster_opts(data_dir)
+            if expected_opts:
+                try:
+                    actual_cmdline = self.cmdline()
+                    if self._verify_process_options(expected_opts, actual_cmdline):
+                        return True
+                    else:
+                        logger.info('Process %s options mismatch with postmaster.opts', self.pid)
+                        return False
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        
+        # Fall back to time-based check for backward compatibility
         try:
             start_time = int(self._postmaster_pid.get('start_time', 0))
             if start_time and abs(self.create_time() - start_time) > 3:
@@ -74,12 +126,6 @@ class PostmasterProcess(psutil.Process):
                 return False
         except ValueError:
             logger.warning('Garbage start time value in pid file: %r', self._postmaster_pid.get('start_time'))
-
-        # Extra safety check. The process can't be ourselves, our parent or our direct child.
-        if self.pid == os.getpid() or self.pid == os.getppid() or self.ppid() == os.getpid():
-            logger.info('Patroni (pid=%s, ppid=%s), "fake postmaster" (pid=%s, ppid=%s)',
-                        os.getpid(), os.getppid(), self.pid, self.ppid())
-            return False
 
         return True
 

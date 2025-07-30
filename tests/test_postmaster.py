@@ -176,3 +176,74 @@ class TestPostmasterProcess(unittest.TestCase):
             self.assertIsNone(PostmasterProcess.from_pidfile(''))
         with patch('builtins.open', mock_open(read_data='123\n')):
             self.assertIsNone(PostmasterProcess.from_pidfile(''))
+
+    @patch('psutil.Process.__init__', Mock())
+    def test_read_postmaster_opts(self):
+        proc = PostmasterProcess(123)
+        proc._postmaster_pid = {'data_dir': '/tmp/data'}
+        
+        # Test file not found
+        with patch('builtins.open', Mock(side_effect=IOError)):
+            self.assertEqual(proc._read_postmaster_opts('/tmp/data'), {})
+        
+        # Test valid postmaster.opts file
+        opts_content = '/usr/bin/postgres "-D" "/tmp/data" "--config-file=/tmp/postgresql.conf" "--port=5432"'
+        with patch('builtins.open', mock_open(read_data=opts_content)):
+            result = proc._read_postmaster_opts('/tmp/data')
+            self.assertEqual(result, {'config-file': '/tmp/postgresql.conf', 'port': '5432'})
+
+    @patch('psutil.Process.__init__', Mock())
+    def test_verify_process_options(self):
+        proc = PostmasterProcess(123)
+        
+        # Test matching options
+        expected_opts = {'config-file': '/tmp/postgresql.conf', 'port': '5432'}
+        actual_cmdline = ['/usr/bin/postgres', '-D', '/tmp/data', '--config-file=/tmp/postgresql.conf', '--port=5432']
+        self.assertTrue(proc._verify_process_options(expected_opts, actual_cmdline))
+        
+        # Test mismatched options
+        actual_cmdline = ['/usr/bin/postgres', '-D', '/tmp/data', '--config-file=/tmp/postgresql.conf', '--port=5433']
+        self.assertFalse(proc._verify_process_options(expected_opts, actual_cmdline))
+        
+        # Test missing options
+        actual_cmdline = ['/usr/bin/postgres', '-D', '/tmp/data', '--config-file=/tmp/postgresql.conf']
+        self.assertFalse(proc._verify_process_options(expected_opts, actual_cmdline))
+
+    @patch('psutil.Process.cmdline')
+    @patch('psutil.Process.create_time')
+    @patch('psutil.Process.__init__', Mock())
+    @patch.object(PostmasterProcess, '_read_postmaster_pidfile')
+    def test_is_postmaster_process_with_cmdline(self, mock_read_pidfile, mock_create_time, mock_cmdline):
+        proc = PostmasterProcess(123)
+        proc._postmaster_pid = {'data_dir': '/tmp/data', 'start_time': '100000'}
+        
+        with patch.object(psutil.Process, 'pid', 123), \
+                patch.object(psutil.Process, 'ppid', return_value=124), \
+                patch('os.getpid', return_value=125), \
+                patch('os.getppid', return_value=126):
+            
+            # Test with matching command line options
+            opts_content = '/usr/bin/postgres "-D" "/tmp/data" "--config-file=/tmp/postgresql.conf" "--port=5432"'
+            with patch('builtins.open', mock_open(read_data=opts_content)):
+                mock_cmdline.return_value = ['/usr/bin/postgres', '-D', '/tmp/data', '--config-file=/tmp/postgresql.conf', '--port=5432']
+                self.assertTrue(proc._is_postmaster_process())
+            
+            # Test with mismatched command line options
+            with patch('builtins.open', mock_open(read_data=opts_content)):
+                mock_cmdline.return_value = ['/usr/bin/postgres', '-D', '/tmp/data', '--config-file=/tmp/postgresql.conf', '--port=5433']
+                self.assertFalse(proc._is_postmaster_process())
+            
+            # Test fallback to time-based check when postmaster.opts is missing
+            with patch('builtins.open', Mock(side_effect=IOError)):
+                mock_create_time.return_value = 100001
+                self.assertTrue(proc._is_postmaster_process())
+                
+                # Test time-based check failure
+                mock_create_time.return_value = 200000
+                self.assertFalse(proc._is_postmaster_process())
+            
+            # Test cmdline access denied - fallback to time check
+            with patch('builtins.open', mock_open(read_data=opts_content)):
+                mock_cmdline.side_effect = psutil.AccessDenied()
+                mock_create_time.return_value = 100001
+                self.assertTrue(proc._is_postmaster_process())
